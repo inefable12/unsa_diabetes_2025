@@ -1,0 +1,383 @@
+---
+title: "Trabajo Final"
+author: "Jesus Antonio Alvarado Huayhuaz"
+output: 
+  pdf_document: default
+  html_document: default
+---
+
+## 1. Librerías necesarias
+
+Requiero cargar la librería "library(readr)". (Previamente instalar install.packages("readr"))
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# Cargar librerías principales
+library(tidyverse)      # incluye ggplot2
+library(caret)
+library(MASS)
+library(randomForest)
+library(e1071)
+library(rpart)
+library(GGally)
+library(pROC)
+library(gridExtra)
+```
+
+
+## 2. Obtener los datos
+
+Escogí el dataset de "Diabetes Health Indicators Dataset" de Kaggle, como se detalla en la tarea.
+
+```{r}
+file_url <- "https://raw.githubusercontent.com/inefable12/unsa_diabetes_2025/refs/heads/main/diabetes_dataset.csv"
+```
+
+Lo cargo en una variable:
+
+```{r}
+# Ajusta la ruta si es necesario
+df <- read.csv(file_url, stringsAsFactors = FALSE)
+```
+
+
+```{r}
+print("Primeras 6 filas de los datos cargados:")
+head(df)
+```
+
+```{r}
+print("Resumen de los datos:")
+summary(df)
+```
+
+
+## 3. Tipos y variable objetivo
+
+```{r}
+# Convertir diagnosed_diabetes a factor con niveles "No" y "Yes"
+# Asumo 0/1; si está como "0"/"1" o "No"/"Yes" ajustar según corresponda
+df$diagnosed_diabetes <- as.character(df$diagnosed_diabetes)
+df$diagnosed_diabetes <- ifelse(df$diagnosed_diabetes %in% c("1","Yes","yes", "TRUE", "True", 1), "Yes", "No")
+df$diagnosed_diabetes <- factor(df$diagnosed_diabetes, levels = c("No","Yes"))
+
+# Convertir columnas categóricas a factor (según tu lista)
+categorical_cols <- c("gender","ethnicity","education_level","income_level","employment_status","smoking_status","diabetes_stage")
+for (c in categorical_cols){
+  if(c %in% names(df)) df[[c]] <- as.factor(df[[c]])
+}
+
+# Comprobar tipos
+str(df)
+table(df$diagnosed_diabetes)
+prop.table(table(df$diagnosed_diabetes))
+```
+
+
+## 4. Análisis exploratorio de datos
+
+```{r}
+# Columnas
+print(colnames(df))
+```
+
+```{r}
+# Ver proporción de clases
+table(df$diagnosed_diabetes)
+```
+
+Cargamos ggplot para graficar. (library(ggplot2))
+
+
+```{r}
+# Distribución de la variable objetivo
+ggplot(df, aes(x = diagnosed_diabetes)) +
+  geom_bar() +
+  labs(title = "Distribución: Diagnosed Diabetes", x = "Diagnosed Diabetes", y = "Cuenta")
+
+# Resumen numérico de variables continuas
+numeric_vars <- df %>% select_if(is.numeric) %>% names()
+summary(df[numeric_vars])
+
+# Matriz de pares (usar subset para no saturar)
+if(length(numeric_vars) >= 6){
+  ggpair_vars <- numeric_vars[1:min(6,length(numeric_vars))]
+  GGally::ggpairs(df[ggpair_vars])
+}
+```
+
+# 5. Valores perdidos
+
+```{r}
+# Mostrar NA por columna
+na_counts <- sapply(df, function(x) sum(is.na(x)))
+na_counts[na_counts > 0]
+
+# Estrategia simple: imputación por la mediana (numéricas) y moda (categóricas)
+# Usaremos preProcess de caret para centrado/escalado y KNN impute opcional
+num_cols <- names(df)[sapply(df, is.numeric)]
+cat_cols <- names(df)[sapply(df, is.factor)]
+
+df <- na.omit(df)
+```
+
+# 6. Encoding y escalado
+
+```{r}
+# Para los modelos que requieren dummies (knn, svm), creamos un dataset con dummies.
+# Usaremos caret::dummyVars
+
+# Guardamos la columna target por separado
+target <- "diagnosed_diabetes"
+
+# Creamos dummies para variables categóricas
+dummies <- dummyVars(as.formula(paste(target, "~ .")), data = df, fullRank = TRUE)
+df_dummies <- data.frame(predict(dummies, newdata = df))
+
+# Añadimos la variable objetivo
+df_dummies[[target]] <- df[[target]]
+
+# Escalado de variables numéricas (centrado y escala)
+preproc_scale <- preProcess(df_dummies[, setdiff(names(df_dummies), target)],
+                            method = c("center", "scale"))
+#preproc_scale <- preProcess(df_dummies %>% select(-all_of(target)), method = c("center","scale"))
+df_ready <- predict(preproc_scale, df_dummies)
+df_ready[[target]] <- df_dummies[[target]]
+
+# Comprobación final
+str(df_ready)
+table(df_ready[[target]])
+```
+
+# 7. Train / Test split
+
+```{r}
+set.seed(123)
+train_idx <- createDataPartition(df_ready$diagnosed_diabetes, p = 0.7, list = FALSE)
+train <- df_ready[train_idx, ]
+test  <- df_ready[-train_idx, ]
+
+# Revisión de balance
+prop.table(table(train$diagnosed_diabetes))
+prop.table(table(test$diagnosed_diabetes))
+```
+
+# 8. Balanceo con upSample 
+
+Asegurarse de tener caret cargado library(caret)
+
+```{r}
+
+# Convertir la variable objetivo a factor (requerido por upSample)
+train$diagnosed_diabetes <- as.factor(train$diagnosed_diabetes)
+
+# Aplicar balanceo con upSample (duplica aleatoriamente la clase minoritaria)
+set.seed(123)
+train_bal <- upSample(
+  x = train[, setdiff(names(train), "diagnosed_diabetes")],
+  y = train$diagnosed_diabetes
+)
+
+# El resultado agrega una columna llamada 'Class' (la variable objetivo balanceada)
+# Renombramos 'Class' nuevamente como 'diagnosed_diabetes' para mantener consistencia
+train_bal <- train_bal %>%
+  rename(diagnosed_diabetes = Class)
+
+# Verificar el nuevo balance de clases
+prop.table(table(train_bal$diagnosed_diabetes))
+```
+
+# 9. TrainControl
+
+
+```{r}
+ctrl <- trainControl(method = "repeatedcv",
+                     number = 5,
+                     repeats = 3,
+                     classProbs = TRUE,
+                     summaryFunction = twoClassSummary,
+                     savePredictions = "final")
+
+```
+
+
+# 10. LDA
+
+```{r}
+
+set.seed(123)
+lda_fit <- train(diagnosed_diabetes ~ ., data = train %>% mutate(diagnosed_diabetes = factor(diagnosed_diabetes, levels=c("No","Yes"))),
+                 method = "lda",
+                 metric = "ROC",
+                 trControl = ctrl)
+
+lda_fit
+lda_pred <- predict(lda_fit, test)
+confusionMatrix(lda_pred, factor(test$diagnosed_diabetes, levels=c("No","Yes")))
+
+```
+
+# 11. CART
+
+```{r}
+
+set.seed(123)
+cart_fit <- train(diagnosed_diabetes ~ ., data = train,
+                  method = "rpart",
+                  metric = "ROC",
+                  trControl = ctrl,
+                  tuneLength = 10)
+cart_fit
+# Plot del árbol final
+rpart.plot(cart_fit$finalModel)
+cart_pred <- predict(cart_fit, test)
+confusionMatrix(cart_pred, factor(test$diagnosed_diabetes, levels=c("No","Yes")))
+
+
+```
+
+# 12. KNN
+
+```{r}
+
+# Processamento paralelo
+
+no_cores <- detectCores() - 1  
+registerDoParallel(cores=no_cores)  
+cl <- makePSOCKcluster(no_cores) 
+
+set.seed(123)
+knn_fit <- train(diagnosed_diabetes ~ ., data = train,
+                 method = "knn",
+                 tuneLength = 10,
+                 metric = "ROC",
+                 trControl = ctrl)
+knn_fit
+knn_pred <- predict(knn_fit, test)
+confusionMatrix(knn_pred, factor(test$diagnosed_diabetes, levels=c("No","Yes")))
+
+```
+
+# 13. SVM lineal
+
+```{r}
+
+# Processamento paralelo
+no_cores <- detectCores() - 1  
+registerDoParallel(cores=no_cores)  
+cl <- makePSOCKcluster(no_cores) 
+
+set.seed(123)
+svm_fit <- train(diagnosed_diabetes ~ ., data = train,
+                 method = "svmLinear",
+                 tuneLength = 6,
+                 metric = "ROC",
+                 trControl = ctrl)
+svm_fit
+svm_pred <- predict(svm_fit, test)
+confusionMatrix(svm_pred, factor(test$diagnosed_diabetes, levels=c("No","Yes")))
+
+```
+
+# 14. Random Forest
+
+```{r}
+
+# Processamento paralelo
+no_cores <- detectCores() - 1  
+registerDoParallel(cores=no_cores)  
+cl <- makePSOCKcluster(no_cores) 
+
+set.seed(123)
+rf_fit <- train(diagnosed_diabetes ~ ., data = train,
+                method = "rf",
+                tuneLength = 6,
+                metric = "ROC",
+                trControl = ctrl,
+                importance = TRUE)
+rf_fit
+rf_pred <- predict(rf_fit, test)
+confusionMatrix(rf_pred, factor(test$diagnosed_diabetes, levels=c("No","Yes")))
+
+# Importancia de variables
+varImp_rf <- varImp(rf_fit)
+plot(varImp_rf, top = 20)
+
+```
+
+# 15. ROC / AUC 
+
+```{r}
+
+# Processamento paralelo
+no_cores <- detectCores() - 1  
+registerDoParallel(cores=no_cores)  
+cl <- makePSOCKcluster(no_cores) 
+
+# Obtener probabilidades
+rf_probs <- predict(rf_fit, test, type = "prob")[, "Yes"]
+svm_probs <- predict(svm_fit, test, type = "prob")[, "Yes"]
+lda_probs <- predict(lda_fit, test, type = "prob")[, "Yes"]
+
+# ROC
+rf_roc <- roc(response = factor(test$diagnosed_diabetes, levels = c("No","Yes")), predictor = rf_probs)
+svm_roc <- roc(response = factor(test$diagnosed_diabetes, levels = c("No","Yes")), predictor = svm_probs)
+lda_roc <- roc(response = factor(test$diagnosed_diabetes, levels = c("No","Yes")), predictor = lda_probs)
+
+# AUCs
+rf_roc$auc
+svm_roc$auc
+lda_roc$auc
+
+# Plot comparativo
+plot(rf_roc, main = "ROC comparativa")
+lines(svm_roc, col = "blue")
+lines(lda_roc, col = "green")
+legend("bottomright", legend = c(paste0("RF AUC=",round(rf_roc$auc,3)),
+                                 paste0("SVM AUC=",round(svm_roc$auc,3)),
+                                 paste0("LDA AUC=",round(lda_roc$auc,3))),
+       col = c("black","blue","green"), lwd = 2)
+
+```
+
+
+# 16. Comparación
+
+```{r}
+
+model_list <- list(LDA = lda_fit, CART = cart_fit, KNN = knn_fit, SVM = svm_fit, RF = rf_fit)
+resamps <- resamples(model_list)
+summary(resamps)
+bwplot(resamps, metric = "ROC")
+dotplot(resamps, metric = "ROC")
+
+```
+
+# 17. Mejor modelo y predicción final
+
+```{r}
+
+# AUC/ROC en resamples o rf_fit si fue el mejor
+best_model <- rf_fit  # ajustar según resultados
+
+# Guardar modelo al disco
+saveRDS(best_model, file = "best_diabetes_model.rds")
+
+# Cargar luego con readRDS("best_diabetes_model.rds")
+
+```
+
+# 18. Predicción en nuevos datos
+```{r}
+
+# new_data <- read.csv("new_patients.csv")
+# new_data_dummies <- data.frame(predict(dummies, newdata = new_data))
+# new_data_scaled <- predict(preproc_scale, new_data_dummies)
+# preds <- predict(best_model, new_data_scaled)
+# probs <- predict(best_model, new_data_scaled, type = "prob")
+
+```
+
+
+
